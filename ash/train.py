@@ -17,6 +17,8 @@ from torch.utils.tensorboard import SummaryWriter
 from torch import nn, optim
 import torch.nn.functional as F
 
+import transformers
+
 import numpy as np
 
 from tqdm import tqdm
@@ -287,9 +289,11 @@ class App(object):
         initialize
 
         train_started:
-        iter_started / train:
-        iter_completed:
-        epoch_completed / validate:
+            epoch_started:
+                iter_started
+                train:
+                iter_completed:
+            epoch_completed / validate:
         train_completed:
 
         evaluate:
@@ -314,7 +318,9 @@ class App(object):
         self.app_name = name
         self.app_root = root
         self.optimizers = {}
+        self.schedulers = {}
         self.optimizer_builders = {}
+        self.scheduler_builders = {}
         self.device = device
         self.config(**kwargs)
 
@@ -324,7 +330,10 @@ class App(object):
 
         # self.event_map = defaultdict(lambda: {"handlers": set(), "uniq": False})
         self.event_map = defaultdict(set)
-        self.event_map["train"] = self.event_map["iter_started"]
+
+        # FUCK NO !!!!!!!!
+        # self.event_map["train"] = self.event_map["iter_started"]
+        
         self.event_q = []
 
         self.extension_map = {}
@@ -359,6 +368,9 @@ class App(object):
         self.model = self.model.to(device)
         for op in self.optimizers:
             self.optimizers[op] = self.optimizer_builders[op]()
+            if self.scheduler_builders.get(op, None):
+                sc = self.scheduler_builders[op](self.optimizers[op])
+                self.schedulers[op] = sc
         return self
     
     def extend(self, ext):
@@ -373,6 +385,11 @@ class App(object):
         e.device = self.device
         e.optimizers = self.optimizers
         return list(map(lambda h: h(e), self.event_map[on_event]))
+        # results = []
+        # for handler in self.event_map[on_event]:
+        #     hres = handler(e)
+        #     results.append(hres)
+        # return results
 
     def on(self, event, handler=None):
         def event_wrapper(handler):
@@ -395,7 +412,7 @@ class App(object):
         self.amp_scaler = amp.GradScaler(**kwargs)
         return self
     
-    def with_optimizer(self, op, params=None, **kwargs):
+    def with_optimizer(self, op, params=None, scheduler=None, **kwargs):
         if issubclass(op, torch.optim.Optimizer):
             if not params:
                 params = [{"params": self.model.parameters()}]
@@ -405,13 +422,16 @@ class App(object):
         optimizer_builder = functools.partial(op, params, **kwargs)
         self.optimizers[op_name] = optimizer_builder()
         self.optimizer_builders[op_name] = optimizer_builder
+        if scheduler:
+            self.scheduler_builders[op_name] = scheduler
         return self
     
-    def with_data_parallel(self, world_size=-1):
+    def with_data_parallel(self, world_size=-1, master_port=-1):
         self.use_ddp = True
         os.environ["OMP_NUM_THREADS"] = "1"
         os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "9600"
+        if master_port > 0:
+            os.environ["MASTER_PORT"] = str(master_port)
         self.ddp_local_rank = int(os.environ['LOCAL_RANK'])
         self.ddp_world_size = world_size
         self.device = torch.device(self.ddp_local_rank)
@@ -437,8 +457,10 @@ class App(object):
     def eval(self, data=None):
         result = {
             "loss": 0.,
+            "count": 0,
             "predict": [],
-            "gold": []
+            "gold": [],
+            "result": [],
         }
 
         if not self.main_device():
@@ -458,9 +480,14 @@ class App(object):
                                             batch=batch)[0]
                 if pred is not None:
                     valid_iters += 1
-                    result["loss"] += pred["loss"].item()
+                    loss = pred["loss"]
+                    if isinstance(loss, torch.Tensor):
+                        loss = loss.item()
+                    result["loss"] += loss
+                    result["count"] += 1
                     result["predict"].append(pred["predict"])
                     result["gold"].append(pred["gold"])
+                    result["result"].append(pred)
         if valid_iters == 0:
             valid_iters = 1
         result["loss"] /= valid_iters
@@ -522,8 +549,17 @@ class App(object):
             avg_loss = 0
             avg_loss_validate = 0
             valid_iters = 0
-            loss = 0
+            # loss = 0
             loss_ = []
+            loss_accumulate = 0
+
+            self.exec_handles("epoch_started",
+                              meta,
+                              current_epoch=current_epoch,
+                              current_iter=current_iter,
+                              max_iters=max_iters,
+                              max_epochs=max_epochs,
+                              use_epoch=use_epoch)
 
             for i,batch in iterator:
                 self.exec_handles("iter_started",
@@ -560,8 +596,8 @@ class App(object):
 
                 loss_ = [loss] if isinstance(loss, (torch.Tensor)) else loss
                 
-                # if loss_[0] < 0:
-                #     continue
+                if loss_[0] < 0:
+                    continue
 
                 loss = sum(loss_)
                 loss /= accumulate
@@ -570,22 +606,36 @@ class App(object):
                     self.amp_scaler.scale(loss).backward()
                 else:
                     loss.backward()
+                
+                loss_accumulate += loss.item()
+                # loss_accumulate += sum(loss_)
 
                 if (i + 1) % accumulate == 0:
+                    # loss_accumulate /= accumulate
+                    
                     if self.use_amp:
+                        # self.amp_scaler.scale(loss_accumulate).backward()
                         for op in self.optimizers:
                             self.amp_scaler.step(self.optimizers[op])
                         self.amp_scaler.update()
                     else:
+                        # import pdb; pdb.set_trace()
+                        # loss_accumulate.backward()
                         for op in self.optimizers:
                             self.optimizers[op].step()
+                        for op in self.schedulers:
+                            self.schedulers[op].step()
+                    
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=2.0, norm_type=2)
+                    
                     # self.model.zero_grad()
                     for op in self.optimizers:
                         self.optimizers[op].zero_grad()
 
-                loss = loss.item()
-                loss_ = [l.item() for l in loss_]
-                avg_loss += loss
+                    # loss = loss.item()
+                    loss_ = [l.item() for l in loss_]
+                    avg_loss += loss_accumulate
+                    
                 valid_iters += 1
                 
                 self.exec_handles("iter_completed",
@@ -595,11 +645,14 @@ class App(object):
                                   current_iter=current_iter,
                                   max_iters=max_iters,
                                   max_epochs=max_epochs,
-                                  loss=loss,
+                                  loss=loss_accumulate,
                                   loss_=loss_,
-                                  avg_loss=avg_loss / valid_iters,
+                                  avg_loss=avg_loss * accumulate / valid_iters,
                                   batch=batch,
                                   i=i)
+                
+                if (i + 1) % accumulate == 0:
+                    loss_accumulate = 0.
                 
                 current_iter += 1
                 
@@ -614,6 +667,7 @@ class App(object):
                 predict = self.eval(validate)
                 if predict:
                     avg_loss_validate = predict["loss"]
+                self.model.train()
 
             self.exec_handles("epoch_completed",
                               meta,
@@ -623,9 +677,9 @@ class App(object):
                               max_iters=max_iters,
                               max_epochs=max_epochs,
                               use_epoch=use_epoch,
-                              loss=loss,
+                              loss=loss_accumulate,
                               loss_=loss_,
-                              avg_loss=avg_loss / valid_iters,
+                              avg_loss=avg_loss * accumulate / valid_iters,
                               avg_loss_validate=avg_loss_validate)
             
             current_epoch += 1
